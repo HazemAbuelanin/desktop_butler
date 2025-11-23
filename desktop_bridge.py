@@ -1,124 +1,143 @@
 import requests
 import time
+import json
+import os
+import logging
+import sys
+
+# --- CONFIGURATION ---
+MQTT_HOST = "127.0.0.1" 
+MQTT_PORT = 9001
+API_URL   = "http://127.0.0.1:5001"
+
+# Force Topics
+os.environ["MQTT_COMMAND_TOPIC"] = "olink/commands"
+os.environ["MQTT_FEEDBACK_TOPIC"] = "olink/commands_feedback"
+
+# We use the library for Connection & Feedback, but we will override the parsing
 from omnilink import OmniLinkEngine, OmniLinkMQTTBridge, AgentFeedback
 
-# Where to send the final commands (Point to the API file above)
-DESKTOP_API_URL = "http://127.0.0.1:5001"
-
-# --- THE MAPPING (The "Context") ---
-# The AI sends "calculator". Linux needs "gnome-calculator".
-# This dictionary bridges the gap between human speech and computer requirements.
 APP_MAP = {
-    "calculator": "gnome-calculator",
-    "code": "code",
+    "calculator": "gnome-calculator", 
+    "code": "code",                  
+    "terminal": "gnome-terminal",
+    "files": "nautilus",             
     "browser": "firefox",
-    # Add more here!
+    "spotify": "spotify",            
+    "editor": "gedit"                
 }
 
-# Helper function to look up the map
-def get_linux_command(app_alias):
-    return APP_MAP.get(app_alias.lower())
-
-# --- HANDLER 1: OPENING APPLICATION ---
-def handle_open_app(event: dict):
-    # 'event' contains everything the AI sent
-    messenger = event.get("messenger") # Tool to talk back to the user
+# --- LOGIC HANDLER ---
+def process_command_logic(command_str, bridge_instance):
+    """
+    Decides what to do based on the clean command string.
+    """
+    print(f"🧠 LOGIC: Processing '{command_str}'")
     
-    # 1. Extract the variable from the template: open_application_[application_name]
-    app_alias = event["vars"].get("application_name", "").lower()
-    
-    # 2. Map "calculator" -> "gnome-calculator"
-    target_cmd = get_linux_command(app_alias)
+    # NOTE: We create a temporary messenger object to send feedback
+    # The library usually does this, but we are doing it manually now.
+    class SimpleMessenger:
+        def send_feedback(self, feedback_obj):
+            # Manually publish feedback to the topic
+            payload = json.dumps(feedback_obj.to_dict())
+            bridge_instance.client.publish(os.environ["MQTT_FEEDBACK_TOPIC"], payload)
+            print(f"📤 FEEDBACK SENT: {payload}")
 
-    if not target_cmd:
-        # Tell the user we don't know this app yet
-        if messenger:
-            messenger.send_feedback(AgentFeedback(f"I don't have a mapping for '{app_alias}'."))
-        return
+    messenger = SimpleMessenger()
 
-    # 3. Send "Feedback" to the UI (User sees "Launching calculator...")
-    if messenger:
-        messenger.send_feedback(AgentFeedback(f"Launching {app_alias} ({target_cmd})..."))
+    # --- ROUTE: OPEN ---
+    if command_str.startswith("open_application_"):
+        app_alias = command_str.replace("open_application_", "").strip()
+        print(f"🚩 ACTION: OPEN '{app_alias}'")
+        
+        target_cmd = APP_MAP.get(app_alias.lower())
+        if not target_cmd:
+            print(f"❌ ERROR: No mapping for '{app_alias}'")
+            messenger.send_feedback(AgentFeedback(f"No mapping for '{app_alias}'"))
+            return
 
-    # 4. Send the HTTP Request to desktop_api.py
+        messenger.send_feedback(AgentFeedback(f"Launching {app_alias}..."))
+        
+        try:
+            requests.post(f"{API_URL}/open_app", json={"app_name": target_cmd}, timeout=2)
+            print(f"✅ API SUCCESS")
+        except Exception as e:
+            print(f"❌ API ERROR: {e}")
+
+    # --- ROUTE: CLOSE ---
+    elif command_str.startswith("close_application_"):
+        app_alias = command_str.replace("close_application_", "").strip()
+        print(f"🚩 ACTION: CLOSE '{app_alias}'")
+        
+        target_cmd = APP_MAP.get(app_alias.lower())
+        if not target_cmd: return
+
+        messenger.send_feedback(AgentFeedback(f"Closing {app_alias}..."))
+        try:
+            requests.post(f"{API_URL}/close_app", json={"app_name": target_cmd})
+            print(f"✅ API SUCCESS")
+        except Exception as e:
+            print(f"❌ API ERROR: {e}")
+
+# --- CUSTOM MESSAGE PROCESSOR ---
+def on_mqtt_message(client, userdata, msg):
+    """
+    This replaces the library's default handler. 
+    It parses JSON and calls our logic directly.
+    """
     try:
-        requests.post(f"{DESKTOP_API_URL}/open_app", json={"app_name": target_cmd})
-    except Exception as e:
-        print(f"API Connection Error: {e}")
-
-# --- HANDLER 2: CLOSING (With Safety) ---
-def handle_close_app(event: dict):
-    messenger = event.get("messenger")
-    # 1. Extract the variable from the template: close_application_[application_name]
-    app_alias = event["vars"].get("application_name", "").lower()
-    # 2. Map the app alias to the target command
-    target_cmd = get_linux_command(app_alias)
-
-    if not target_cmd:
-        if messenger:
-            messenger.send_feedback(AgentFeedback(f"I don't have a mapping for '{app_alias}' to close."))
-        return
-
-    # --- THE SAFETY CHECK ---
-    if messenger:
-        # 1. Ask the Question
-        question_text = f"⚠️ Safety Check: Are you sure you want to kill '{app_alias}'?"
+        payload = msg.payload.decode()
+        print("\n" + "="*40)
+        print(f"📥 RECEIVED RAW: {payload}")
         
-        # 2. PAUSE execution and wait for the user to click a button in the UI
-        reply = messenger.ask_question(question_text, choices=["Yes, kill it", "Cancel"]).wait(timeout=30)
+        # 1. Parse JSON
+        data = json.loads(payload)
         
-        # 3. Check the answer
-        if reply and reply.get("answer") == "Yes, kill it":
-            messenger.send_feedback(AgentFeedback(f"Terminating {app_alias}..."))
-            # 4. Only NOW do we send the request to the API
-            try:
-                requests.post(f"{DESKTOP_API_URL}/close_app", json={"app_name": target_cmd})
-            except Exception as e:
-                print(f"API Connection Error: {e}")
+        # 2. Extract Command
+        command_str = data.get("command")
+        
+        if command_str:
+            print(f"✅ EXTRACTED COMMAND: {command_str}")
+            # 3. Run Logic
+            process_command_logic(command_str, userdata['bridge'])
         else:
-            messenger.send_feedback(AgentFeedback("Action cancelled."))
-
-# --- HANDLER 3: OPENING URL (NEW) ---
-def handle_open_url(event: dict):
-    messenger = event.get("messenger")
-    
-    # 1. Extract the URL from the template: open_url_[url]
-    url = event["vars"].get("url", "")
-    
-    if not url:
-        if messenger:
-            messenger.send_feedback(AgentFeedback("No URL provided to open."))
-        return
-
-    # 2. Send "Feedback" to the UI
-    if messenger:
-        messenger.send_feedback(AgentFeedback(f"Opening URL: {url}..."))
-
-    # 3. Send the HTTP Request to desktop_api.py
-    try:
-        # This assumes your desktop_api.py has a /open_url endpoint that handles this
-        requests.post(f"{DESKTOP_API_URL}/open_url", json={"url": url})
+            print("⚠️ JSON valid, but no 'command' field.")
+            
+    except json.JSONDecodeError:
+        print("⚠️ Not JSON. Ignoring.")
     except Exception as e:
-        print(f"API Connection Error: {e}")
+        print(f"❌ CRITICAL ERROR processing message: {e}")
 
+# --- SETUP ---
+engine = OmniLinkEngine([]) 
 
-# --- STARTUP SEQUENCE ---
-engine = OmniLinkEngine([]) # Create the brain
+print("--- DesktopButler Bridge (Custom Parser) ---")
+print(f"Target: {MQTT_HOST}:{MQTT_PORT}")
 
-# Teach the brain the templates
-engine.on_template("open_application_[application_name]", handle_open_app)
-engine.on_template("close_application_[application_name]", handle_close_app)
-engine.on_template("open_url_[url]", handle_open_url)
+# Initialize Bridge
+bridge = OmniLinkMQTTBridge(
+    engine, 
+    host=MQTT_HOST, 
+    port=MQTT_PORT, 
+    transport="websockets"
+)
 
-# Connect the ears (WebSockets, Port 9001)
-bridge = OmniLinkMQTTBridge(engine, host="localhost", port=9001, transport="websockets")
+# --- THE OVERRIDE ---
+# We inject our custom handler into the Paho client
+# We pass the 'bridge' object in userdata so the handler can send feedback
+bridge.client.user_data_set({'bridge': bridge})
+bridge.client.on_message = on_mqtt_message
+# --------------------
 
 if __name__ == "__main__":
-    bridge.start() # Start the background thread
+    bridge.start()
+    # We must manually subscribe because we overrode the start sequence logic behavior
+    # Wait a moment for connection then subscribe
+    time.sleep(1) 
+    print(f"🔌 Subscribing to {os.environ['MQTT_COMMAND_TOPIC']}...")
+    bridge.client.subscribe(os.environ["MQTT_COMMAND_TOPIC"])
     
-    # Keep the main script running forever so the bridge doesn't die
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         bridge.stop()
