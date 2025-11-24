@@ -14,7 +14,7 @@ API_URL   = "http://127.0.0.1:5001"
 os.environ["MQTT_COMMAND_TOPIC"] = "olink/commands"
 os.environ["MQTT_FEEDBACK_TOPIC"] = "olink/commands_feedback"
 
-# We use the library for Connection & Feedback, but we will override the parsing
+# We use the library for Connection & Feedback objects
 from omnilink import OmniLinkEngine, OmniLinkMQTTBridge, AgentFeedback
 
 APP_MAP = {
@@ -34,12 +34,18 @@ def process_command_logic(command_str, bridge_instance):
     """
     print(f"🧠 LOGIC: Processing '{command_str}'")
     
-    # NOTE: We create a temporary messenger object to send feedback
-    # The library usually does this, but we are doing it manually now.
+    # --- CUSTOM MESSENGER ---
     class SimpleMessenger:
         def send_feedback(self, feedback_obj):
-            # Manually publish feedback to the topic
-            payload = json.dumps(feedback_obj.to_dict())
+            # FIX: Manually construct the dict instead of calling .to_dict()
+            # The AgentFeedback object usually has 'message' and 'kind' attributes
+            payload_dict = {
+                "kind": "feedback",
+                "message": feedback_obj.message,
+                "ok": True  # Default to true for generic feedback
+            }
+            
+            payload = json.dumps(payload_dict)
             bridge_instance.client.publish(os.environ["MQTT_FEEDBACK_TOPIC"], payload)
             print(f"📤 FEEDBACK SENT: {payload}")
 
@@ -111,7 +117,7 @@ def on_mqtt_message(client, userdata, msg):
 # --- SETUP ---
 engine = OmniLinkEngine([]) 
 
-print("--- DesktopButler Bridge (Custom Parser) ---")
+print("--- DesktopButler Bridge (Custom Parser + Feedback Fix) ---")
 print(f"Target: {MQTT_HOST}:{MQTT_PORT}")
 
 # Initialize Bridge
@@ -123,16 +129,12 @@ bridge = OmniLinkMQTTBridge(
 )
 
 # --- THE OVERRIDE ---
-# We inject our custom handler into the Paho client
-# We pass the 'bridge' object in userdata so the handler can send feedback
 bridge.client.user_data_set({'bridge': bridge})
 bridge.client.on_message = on_mqtt_message
 # --------------------
 
 if __name__ == "__main__":
     bridge.start()
-    # We must manually subscribe because we overrode the start sequence logic behavior
-    # Wait a moment for connection then subscribe
     time.sleep(1) 
     print(f"🔌 Subscribing to {os.environ['MQTT_COMMAND_TOPIC']}...")
     bridge.client.subscribe(os.environ["MQTT_COMMAND_TOPIC"])
